@@ -1,10 +1,11 @@
 #!/bin/bash
 #
 # DockerFromScratch - Idempotent Docker Host Setup
-# Sets up Docker, Portainer CE, and Nginx Proxy Manager on Ubuntu 24.04
+# Sets up Docker, Portainer CE, and optionally Nginx Proxy Manager on Ubuntu 24.04
 #
 # Usage: curl -fsSL https://raw.githubusercontent.com/GonzFC/DockerFromScratch/main/setup.sh | bash
 #    or: bash setup.sh
+#    or: bash setup.sh --uninstall-npm
 #
 # Repository: https://github.com/GonzFC/DockerFromScratch
 #
@@ -21,6 +22,12 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 BOLD='\033[1m'
+
+#=============================================================================
+# GLOBAL VARIABLES
+#=============================================================================
+SCRIPT_MODE="install"
+CONFIG_INSTALL_NPM="y"
 
 #=============================================================================
 # HELPER FUNCTIONS
@@ -115,6 +122,140 @@ check_ubuntu() {
     fi
 }
 
+show_usage() {
+    cat <<EOF
+DockerFromScratch - Idempotent Docker Host Setup
+
+Usage: $0 [OPTIONS]
+
+OPTIONS:
+    --help              Show this help message
+    --uninstall-npm     Uninstall Nginx Proxy Manager
+
+EXAMPLES:
+    $0                  Run interactive setup
+    $0 --uninstall-npm  Remove NPM container and data
+
+EOF
+}
+
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h)
+                show_usage
+                exit 0
+                ;;
+            --uninstall-npm)
+                SCRIPT_MODE="uninstall-npm"
+                shift
+                ;;
+            *)
+                print_error "Unknown option: $1"
+                show_usage
+                exit 1
+                ;;
+        esac
+    done
+}
+
+#=============================================================================
+# UNINSTALL FUNCTIONS
+#=============================================================================
+uninstall_npm() {
+    print_header "Uninstall Nginx Proxy Manager"
+
+    echo ""
+    print_warning "This will remove the NPM container and optionally its data."
+    echo ""
+
+    # Try to find NPM compose directory
+    local npm_dirs=(
+        "$HOME/docker-compose/npm"
+        "/home/$USER/docker-compose/npm"
+    )
+
+    local NPM_DIR=""
+    for dir in "${npm_dirs[@]}"; do
+        if [[ -f "$dir/docker-compose.yml" ]]; then
+            NPM_DIR="$dir"
+            break
+        fi
+    done
+
+    # Check if NPM container exists
+    if ! docker ps -a --format '{{.Names}}' | grep -q '^npm$'; then
+        print_info "NPM container not found."
+
+        if [[ -z "$NPM_DIR" ]]; then
+            print_info "No NPM installation detected."
+            return
+        fi
+    fi
+
+    # Ask for confirmation
+    if ! ask_yes_no "Are you sure you want to uninstall Nginx Proxy Manager?" "n"; then
+        print_info "Uninstall cancelled."
+        return
+    fi
+
+    # Stop and remove container
+    if docker ps -a --format '{{.Names}}' | grep -q '^npm$'; then
+        print_step "Stopping NPM container..."
+        docker stop npm 2>/dev/null || true
+
+        print_step "Removing NPM container..."
+        docker rm npm 2>/dev/null || true
+        print_success "NPM container removed"
+    fi
+
+    # Remove compose file
+    if [[ -n "$NPM_DIR" ]] && [[ -f "$NPM_DIR/docker-compose.yml" ]]; then
+        print_step "Removing compose directory..."
+        rm -rf "$NPM_DIR"
+        print_success "Compose directory removed: $NPM_DIR"
+    fi
+
+    # Ask about data removal
+    echo ""
+    local data_dirs=(
+        "/data/npm"
+    )
+
+    for data_dir in "${data_dirs[@]}"; do
+        if [[ -d "$data_dir" ]]; then
+            print_warning "NPM data directory found: $data_dir"
+
+            if ask_yes_no "Remove NPM data (certificates, config)? THIS CANNOT BE UNDONE!" "n"; then
+                print_step "Removing NPM data..."
+                sudo rm -rf "$data_dir"
+                print_success "NPM data removed: $data_dir"
+            else
+                print_info "NPM data preserved at: $data_dir"
+            fi
+        fi
+    done
+
+    # Remove NPM image (optional)
+    echo ""
+    if docker images | grep -q "jc21/nginx-proxy-manager"; then
+        if ask_yes_no "Remove NPM Docker image to free disk space?" "y"; then
+            print_step "Removing NPM image..."
+            docker rmi jc21/nginx-proxy-manager:latest 2>/dev/null || true
+            print_success "NPM image removed"
+        fi
+    fi
+
+    print_header "NPM Uninstall Complete"
+    echo ""
+    print_success "Nginx Proxy Manager has been uninstalled."
+    echo ""
+    print_info "If you had firewall rules for ports 80/443, you may want to remove them:"
+    echo "  sudo ufw delete allow 80/tcp"
+    echo "  sudo ufw delete allow 443/tcp"
+    echo ""
+}
+
 #=============================================================================
 # CONFIGURATION GATHERING
 #=============================================================================
@@ -148,6 +289,11 @@ gather_configuration() {
     # Compose directory
     CONFIG_COMPOSE_DIR=$(ask_input "Directory for docker-compose files" "$HOME/docker-compose")
 
+    # NPM installation (optional)
+    echo ""
+    print_info "Nginx Proxy Manager provides reverse proxy with Let's Encrypt SSL."
+    CONFIG_INSTALL_NPM=$(ask_yes_no "Install Nginx Proxy Manager?" "y" && echo "y" || echo "n")
+
     echo ""
     print_header "Configuration Summary"
     echo ""
@@ -157,6 +303,7 @@ gather_configuration() {
     echo "  UFW Firewall:    $CONFIG_SETUP_UFW"
     echo "  Docker network:  $CONFIG_NETWORK_NAME"
     echo "  Compose dir:     $CONFIG_COMPOSE_DIR"
+    echo "  Install NPM:     $CONFIG_INSTALL_NPM"
     echo ""
 
     if ! ask_yes_no "Proceed with this configuration?" "y"; then
@@ -224,8 +371,11 @@ setup_data_directory() {
 
     # Create subdirectories
     sudo mkdir -p "$CONFIG_DATA_DIR/portainer"
-    sudo mkdir -p "$CONFIG_DATA_DIR/npm/data"
-    sudo mkdir -p "$CONFIG_DATA_DIR/npm/letsencrypt"
+
+    if [[ "$CONFIG_INSTALL_NPM" == "y" ]]; then
+        sudo mkdir -p "$CONFIG_DATA_DIR/npm/data"
+        sudo mkdir -p "$CONFIG_DATA_DIR/npm/letsencrypt"
+    fi
 
     # Set ownership
     sudo chown -R "$USER:$USER" "$CONFIG_DATA_DIR"
@@ -250,13 +400,20 @@ setup_firewall() {
 
     # Add rules (idempotent)
     sudo ufw allow 22/tcp comment 'SSH' 2>/dev/null || true
-    sudo ufw allow 80/tcp comment 'HTTP' 2>/dev/null || true
-    sudo ufw allow 443/tcp comment 'HTTPS' 2>/dev/null || true
+
+    if [[ "$CONFIG_INSTALL_NPM" == "y" ]]; then
+        sudo ufw allow 80/tcp comment 'HTTP' 2>/dev/null || true
+        sudo ufw allow 443/tcp comment 'HTTPS' 2>/dev/null || true
+    fi
 
     # Enable UFW
     echo "y" | sudo ufw enable 2>/dev/null || true
 
-    print_success "UFW configured (ports 22, 80, 443 open)"
+    if [[ "$CONFIG_INSTALL_NPM" == "y" ]]; then
+        print_success "UFW configured (ports 22, 80, 443 open)"
+    else
+        print_success "UFW configured (port 22 open)"
+    fi
 }
 
 #=============================================================================
@@ -478,12 +635,16 @@ verify_installation() {
         ALL_OK=false
     fi
 
-    # Check NPM
-    if docker ps --format '{{.Names}}' | grep -q '^npm$'; then
-        print_success "NPM container is running"
+    # Check NPM (only if installed)
+    if [[ "$CONFIG_INSTALL_NPM" == "y" ]]; then
+        if docker ps --format '{{.Names}}' | grep -q '^npm$'; then
+            print_success "NPM container is running"
+        else
+            print_error "NPM container is not running"
+            ALL_OK=false
+        fi
     else
-        print_error "NPM container is not running"
-        ALL_OK=false
+        print_info "NPM not installed (skipped by user)"
     fi
 
     # Check network
@@ -571,7 +732,8 @@ print_portainer_quickstart() {
 
     print_header "Portainer CE - Quick Start Guide"
 
-    cat <<EOF
+    if [[ "$CONFIG_INSTALL_NPM" == "y" ]]; then
+        cat <<EOF
 
 ${BOLD}1. INITIAL ACCESS${NC}
    ${YELLOW}Important:${NC} Portainer has no exposed ports by default.
@@ -587,6 +749,26 @@ ${BOLD}1. INITIAL ACCESS${NC}
 
    ${YELLOW}Or${NC} set up NPM proxy first, then access via HTTPS proxy.
 
+EOF
+    else
+        cat <<EOF
+
+${BOLD}1. INITIAL ACCESS (No NPM installed)${NC}
+   You need to expose Portainer's port to access the web UI.
+
+   a) Edit ${CYAN}$CONFIG_COMPOSE_DIR/portainer/docker-compose.yml${NC}
+   b) Add ports section under the portainer service:
+      ${CYAN}ports:
+        - "9443:9443"${NC}
+   c) Run: ${CYAN}cd $CONFIG_COMPOSE_DIR/portainer && docker compose up -d${NC}
+   d) Access: ${CYAN}https://$IP:9443${NC} (accept self-signed cert warning)
+
+   ${YELLOW}Tip:${NC} To install NPM later, run this script again.
+
+EOF
+    fi
+
+    cat <<EOF
 ${BOLD}2. CREATE ADMIN USER${NC}
    • Set username and strong password
    • Click "Create user"
@@ -612,10 +794,15 @@ ${BOLD}5. COMMON TASKS${NC}
    │ Container shell     │ Containers → (select) → Console     │
    └─────────────────────┴─────────────────────────────────────┘
 
+EOF
+
+    if [[ "$CONFIG_INSTALL_NPM" == "y" ]]; then
+        cat <<EOF
 ${BOLD}6. REMOVE DIRECT ACCESS (After NPM proxy works)${NC}
    Remove the ports section from docker-compose.yml and redeploy.
 
 EOF
+    fi
 }
 
 print_final_summary() {
@@ -635,12 +822,24 @@ ${BOLD}SERVER DETAILS${NC}
 ${BOLD}INSTALLED COMPONENTS${NC}
   • Docker CE with Compose plugin
   • Portainer CE (container management)
+EOF
+
+    if [[ "$CONFIG_INSTALL_NPM" == "y" ]]; then
+        cat <<EOF
   • Nginx Proxy Manager (reverse proxy + SSL)
+EOF
+    fi
+
+    cat <<EOF
 
 ${BOLD}DIRECTORIES${NC}
   Compose files: $CONFIG_COMPOSE_DIR
   Persistent data: $CONFIG_DATA_DIR
 
+EOF
+
+    if [[ "$CONFIG_INSTALL_NPM" == "y" ]]; then
+        cat <<EOF
 ${BOLD}QUICK ACCESS${NC}
   NPM Admin:   http://$IP:81
 
@@ -650,6 +849,20 @@ ${BOLD}NEXT STEPS${NC}
   3. Create proxy hosts for NPM and Portainer
   4. Access Portainer through NPM proxy
   5. Lock down direct port access
+EOF
+    else
+        cat <<EOF
+${BOLD}NEXT STEPS${NC}
+  1. Expose Portainer port 9443 in docker-compose.yml
+  2. Access Portainer at https://$IP:9443
+  3. Create admin user and configure Docker management
+
+${BOLD}TO INSTALL NPM LATER${NC}
+  Run this script again and choose to install NPM.
+EOF
+    fi
+
+    cat <<EOF
 
 ${BOLD}USEFUL COMMANDS${NC}
   docker ps                              # List running containers
@@ -657,6 +870,17 @@ ${BOLD}USEFUL COMMANDS${NC}
   docker compose -f <file> pull && \\
     docker compose -f <file> up -d       # Update containers
 
+EOF
+
+    if [[ "$CONFIG_INSTALL_NPM" == "y" ]]; then
+        cat <<EOF
+${BOLD}TO UNINSTALL NPM${NC}
+  bash setup.sh --uninstall-npm
+
+EOF
+    fi
+
+    cat <<EOF
 ${YELLOW}Note:${NC} Log out and back in (or run 'newgrp docker') to use Docker without sudo.
 
 EOF
@@ -665,9 +889,7 @@ EOF
 #=============================================================================
 # MAIN
 #=============================================================================
-main() {
-    clear
-
+print_banner() {
     echo -e "${BOLD}"
     cat <<'EOF'
   ____             _             _____                    ____                 _       _
@@ -681,7 +903,9 @@ EOF
     echo -e "${CYAN}Idempotent Docker Host Setup for Ubuntu 24.04${NC}"
     echo -e "${CYAN}https://github.com/GonzFC/DockerFromScratch${NC}"
     echo ""
+}
 
+main_install() {
     # Pre-flight checks
     check_root
     check_ubuntu
@@ -704,15 +928,42 @@ EOF
 
     # Application installation
     install_portainer
-    install_npm
+
+    if [[ "$CONFIG_INSTALL_NPM" == "y" ]]; then
+        install_npm
+    fi
 
     # Verification
     verify_installation
 
     # Quick start guides
-    print_npm_quickstart
+    if [[ "$CONFIG_INSTALL_NPM" == "y" ]]; then
+        print_npm_quickstart
+    fi
     print_portainer_quickstart
     print_final_summary
+}
+
+main() {
+    # Parse command line arguments
+    parse_arguments "$@"
+
+    clear
+    print_banner
+
+    case "$SCRIPT_MODE" in
+        install)
+            main_install
+            ;;
+        uninstall-npm)
+            check_root
+            uninstall_npm
+            ;;
+        *)
+            print_error "Unknown mode: $SCRIPT_MODE"
+            exit 1
+            ;;
+    esac
 }
 
 # Run main function
