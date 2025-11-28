@@ -270,8 +270,37 @@ gather_configuration() {
     CURRENT_HOSTNAME=$(hostname -f 2>/dev/null || hostname)
     CONFIG_HOSTNAME=$(ask_input "Fully qualified hostname" "$CURRENT_HOSTNAME")
 
-    # Data directory
-    CONFIG_DATA_DIR=$(ask_input "Data directory for persistent storage" "/data")
+    # Data directory - detect best default
+    echo ""
+    DEFAULT_DATA_DIR="/data"
+
+    # Check if /data exists as a mount point (separate partition/drive)
+    if mountpoint -q /data 2>/dev/null; then
+        print_info "Detected /data as a separate mount point."
+        DEFAULT_DATA_DIR="/data"
+    elif [[ -d /data ]]; then
+        print_info "Directory /data exists."
+        DEFAULT_DATA_DIR="/data"
+    else
+        # No /data mount - suggest home directory for single-drive setups
+        print_info "No separate /data partition detected."
+        print_info "For single-drive setups, using home directory is recommended."
+        DEFAULT_DATA_DIR="$HOME/docker-data"
+    fi
+
+    CONFIG_DATA_DIR=$(ask_input "Data directory for persistent storage" "$DEFAULT_DATA_DIR")
+
+    # Warn if using root filesystem for /data
+    if [[ "$CONFIG_DATA_DIR" == "/data" ]] && ! mountpoint -q /data 2>/dev/null; then
+        if [[ ! -d /data ]]; then
+            echo ""
+            print_warning "/data will be created on the root filesystem."
+            print_info "This is fine, but ensure your root partition has enough space."
+            ROOT_FREE=$(df -h / | awk 'NR==2 {print $4}')
+            print_info "Current free space on /: $ROOT_FREE"
+            echo ""
+        fi
+    fi
 
     # Timezone
     CURRENT_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")

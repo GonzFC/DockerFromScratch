@@ -100,12 +100,22 @@ The script will prompt for:
 | Option | Default | Description |
 |--------|---------|-------------|
 | Hostname | Current hostname | Fully qualified domain name |
-| Data directory | `/data` | Persistent storage location |
+| Data directory | Auto-detected* | Persistent storage location |
 | Timezone | Current timezone | Server timezone |
 | UFW Firewall | Yes | Configure firewall rules |
 | Docker network | `proxy-network` | Network for proxied containers |
 | Compose directory | `~/docker-compose` | Location for compose files |
 | **Install NPM** | **Yes** | **Install Nginx Proxy Manager** |
+
+### Data Directory Auto-Detection
+
+The script intelligently detects your storage setup:
+
+- **Separate `/data` mount**: If `/data` is a mounted partition (common in multi-drive setups), it uses `/data`
+- **Existing `/data` directory**: If `/data` exists, it uses `/data`
+- **Single-drive setup**: If neither exists, it defaults to `~/docker-data` to avoid filling the root filesystem
+
+You can always override the default with any path you prefer.
 
 ## Post-Installation
 
