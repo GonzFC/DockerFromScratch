@@ -107,15 +107,43 @@ The script will prompt for:
 | Compose directory | `~/docker-compose` | Location for compose files |
 | **Install NPM** | **Yes** | **Install Nginx Proxy Manager** |
 
-### Data Directory Auto-Detection
+### Data Directory & Drive Auto-Detection
 
 The script intelligently detects your storage setup:
 
-- **Separate `/data` mount**: If `/data` is a mounted partition (common in multi-drive setups), it uses `/data`
+- **Separate `/data` mount**: If `/data` is a mounted partition, it uses `/data`
 - **Existing `/data` directory**: If `/data` exists, it uses `/data`
-- **Single-drive setup**: If neither exists, it defaults to `~/docker-data` to avoid filling the root filesystem
+- **Available unmounted drives**: If unused drives are detected, offers to format and mount one
+- **Single-drive setup**: If no additional drives, defaults to `~/docker-data`
 
 You can always override the default with any path you prefer.
+
+### Automatic Drive Setup
+
+If the script detects unmounted drives (e.g., a newly attached virtual disk), it will offer to set one up:
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║ Available Drives Detected
+╚══════════════════════════════════════════════════════════════╝
+
+ℹ The following unmounted drives were detected:
+
+  1) /dev/xvdb - 32G
+
+ℹ You can set up one of these drives for Docker data storage.
+ℹ This is recommended for production setups to separate data from the OS.
+
+Would you like to set up a drive for /data? [Y/n]:
+```
+
+The setup process will:
+1. Create a GPT partition table
+2. Create a single ext4 partition
+3. Add the mount to `/etc/fstab` (persists across reboots)
+4. Mount the drive at `/data`
+
+**Tip**: You can attach a new virtual drive to your VM before running the script, and it will be automatically detected.
 
 ## Post-Installation
 

@@ -257,6 +257,224 @@ uninstall_npm() {
 }
 
 #=============================================================================
+# DRIVE DETECTION AND SETUP
+#=============================================================================
+detect_available_drives() {
+    # Find block devices that are:
+    # - Not mounted
+    # - Not the boot/root disk
+    # - Not partitions of mounted disks
+    # - Not loop devices, ram disks, etc.
+
+    local available_drives=()
+    local root_disk=""
+
+    # Find the disk that contains the root filesystem
+    root_disk=$(lsblk -no PKNAME $(findmnt -n -o SOURCE /) 2>/dev/null | head -1)
+
+    # List all block devices
+    while IFS= read -r line; do
+        local dev=$(echo "$line" | awk '{print $1}')
+        local size=$(echo "$line" | awk '{print $2}')
+        local type=$(echo "$line" | awk '{print $3}')
+        local mountpoint=$(echo "$line" | awk '{print $4}')
+
+        # Skip if it's a partition (we want whole disks)
+        [[ "$type" != "disk" ]] && continue
+
+        # Skip the root disk
+        [[ "$dev" == "$root_disk" ]] && continue
+
+        # Skip if any partition of this disk is mounted
+        if lsblk -no MOUNTPOINT "/dev/$dev" 2>/dev/null | grep -q .; then
+            continue
+        fi
+
+        # This is an available disk
+        available_drives+=("$dev:$size")
+
+    done < <(lsblk -dn -o NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null)
+
+    # Return the list
+    echo "${available_drives[@]}"
+}
+
+show_available_drives() {
+    local drives=($1)
+
+    if [[ ${#drives[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    echo ""
+    print_header "Available Drives Detected"
+    echo ""
+    print_info "The following unmounted drives were detected:"
+    echo ""
+
+    local i=1
+    for drive_info in "${drives[@]}"; do
+        local dev=$(echo "$drive_info" | cut -d: -f1)
+        local size=$(echo "$drive_info" | cut -d: -f2)
+        echo "  $i) /dev/$dev - $size"
+        ((i++))
+    done
+
+    echo ""
+    return 0
+}
+
+setup_new_drive() {
+    local device="$1"
+    local mount_point="$2"
+
+    print_header "Setting Up Drive: /dev/$device"
+
+    echo ""
+    print_warning "This will ERASE ALL DATA on /dev/$device!"
+    print_info "The drive will be formatted with ext4 and mounted at $mount_point"
+    echo ""
+
+    if ! ask_yes_no "Are you sure you want to format /dev/$device?" "n"; then
+        print_info "Drive setup cancelled."
+        return 1
+    fi
+
+    # Double confirmation for safety
+    echo ""
+    print_warning "FINAL WARNING: All data on /dev/$device will be permanently lost!"
+    read -r -p "Type 'YES' to confirm: " confirm
+    if [[ "$confirm" != "YES" ]]; then
+        print_info "Drive setup cancelled."
+        return 1
+    fi
+
+    echo ""
+    print_step "Creating GPT partition table on /dev/$device..."
+    sudo parted -s "/dev/$device" mklabel gpt
+    if [[ $? -ne 0 ]]; then
+        print_error "Failed to create partition table"
+        return 1
+    fi
+
+    print_step "Creating partition..."
+    sudo parted -s "/dev/$device" mkpart primary ext4 0% 100%
+    if [[ $? -ne 0 ]]; then
+        print_error "Failed to create partition"
+        return 1
+    fi
+
+    # Wait for partition to appear
+    sleep 2
+
+    # Determine partition name (could be sdb1 or xvdb1 or nvme0n1p1)
+    local partition=""
+    if [[ -b "/dev/${device}1" ]]; then
+        partition="${device}1"
+    elif [[ -b "/dev/${device}p1" ]]; then
+        partition="${device}p1"
+    else
+        print_error "Could not find the created partition"
+        return 1
+    fi
+
+    print_step "Formatting /dev/$partition with ext4..."
+    sudo mkfs.ext4 -F "/dev/$partition"
+    if [[ $? -ne 0 ]]; then
+        print_error "Failed to format partition"
+        return 1
+    fi
+
+    print_step "Creating mount point at $mount_point..."
+    sudo mkdir -p "$mount_point"
+
+    print_step "Getting partition UUID..."
+    local uuid=$(sudo blkid -s UUID -o value "/dev/$partition")
+    if [[ -z "$uuid" ]]; then
+        print_error "Could not get partition UUID"
+        return 1
+    fi
+
+    print_step "Adding entry to /etc/fstab..."
+    # Check if entry already exists
+    if grep -q "$uuid" /etc/fstab; then
+        print_info "Entry already exists in /etc/fstab"
+    else
+        echo "UUID=$uuid $mount_point ext4 defaults 0 2" | sudo tee -a /etc/fstab > /dev/null
+    fi
+
+    print_step "Mounting the drive..."
+    sudo mount -a
+    if [[ $? -ne 0 ]]; then
+        print_error "Failed to mount drive"
+        return 1
+    fi
+
+    # Verify mount
+    if mountpoint -q "$mount_point"; then
+        print_success "Drive successfully set up and mounted at $mount_point"
+
+        # Set ownership
+        sudo chown -R "$USER:$USER" "$mount_point"
+
+        # Show result
+        echo ""
+        df -h "$mount_point"
+        echo ""
+        return 0
+    else
+        print_error "Drive setup completed but mount verification failed"
+        return 1
+    fi
+}
+
+offer_drive_setup() {
+    # Detect available drives
+    local drives_string=$(detect_available_drives)
+    local drives=($drives_string)
+
+    if [[ ${#drives[@]} -eq 0 ]]; then
+        # No available drives found
+        return 1
+    fi
+
+    show_available_drives "$drives_string"
+
+    print_info "You can set up one of these drives for Docker data storage."
+    print_info "This is recommended for production setups to separate data from the OS."
+    echo ""
+
+    if ! ask_yes_no "Would you like to set up a drive for /data?" "y"; then
+        print_info "Skipping drive setup. You can set up a drive manually later."
+        return 1
+    fi
+
+    # If only one drive, use it; otherwise ask
+    local selected_drive=""
+    if [[ ${#drives[@]} -eq 1 ]]; then
+        selected_drive=$(echo "${drives[0]}" | cut -d: -f1)
+    else
+        echo ""
+        read -r -p "Enter the number of the drive to use (1-${#drives[@]}): " selection
+
+        if [[ "$selection" =~ ^[0-9]+$ ]] && [[ "$selection" -ge 1 ]] && [[ "$selection" -le ${#drives[@]} ]]; then
+            selected_drive=$(echo "${drives[$((selection-1))]}" | cut -d: -f1)
+        else
+            print_error "Invalid selection"
+            return 1
+        fi
+    fi
+
+    # Set up the selected drive
+    if setup_new_drive "$selected_drive" "/data"; then
+        DRIVE_SETUP_SUCCESS=true
+        return 0
+    else
+        return 1
+    fi
+}
+
+#=============================================================================
 # CONFIGURATION GATHERING
 #=============================================================================
 gather_configuration() {
@@ -273,6 +491,7 @@ gather_configuration() {
     # Data directory - detect best default
     echo ""
     DEFAULT_DATA_DIR="/data"
+    DRIVE_SETUP_SUCCESS=false
 
     # Check if /data exists as a mount point (separate partition/drive)
     if mountpoint -q /data 2>/dev/null; then
@@ -282,10 +501,17 @@ gather_configuration() {
         print_info "Directory /data exists."
         DEFAULT_DATA_DIR="/data"
     else
-        # No /data mount - suggest home directory for single-drive setups
+        # No /data mount - check for available drives
         print_info "No separate /data partition detected."
-        print_info "For single-drive setups, using home directory is recommended."
-        DEFAULT_DATA_DIR="$HOME/docker-data"
+
+        # Offer to set up a new drive if available
+        if offer_drive_setup; then
+            DEFAULT_DATA_DIR="/data"
+        else
+            # No drive setup - suggest home directory for single-drive setups
+            print_info "For single-drive setups, using home directory is recommended."
+            DEFAULT_DATA_DIR="$HOME/docker-data"
+        fi
     fi
 
     CONFIG_DATA_DIR=$(ask_input "Data directory for persistent storage" "$DEFAULT_DATA_DIR")
